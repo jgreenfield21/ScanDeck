@@ -1,5 +1,10 @@
 # ScanDeck — free, open-source Mac scanning software for trading cards
 
+[![CI](https://github.com/eliseorobles/ScanDeck/actions/workflows/ci.yml/badge.svg)](https://github.com/eliseorobles/ScanDeck/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+![Platform: macOS 26](https://img.shields.io/badge/platform-macOS%2026-lightgrey)
+![Swift 6.2](https://img.shields.io/badge/Swift-6.2-orange)
+
 **Batch-scan trading cards front and back on macOS, at 600 dpi, with a real
 scanner-background border — and get numbered `_F` / `_B` pairs a listing tool
 can read.** ScanDeck drives a duplex ADF document scanner, crops each side to
@@ -222,9 +227,12 @@ The app scans real batches end to end on a physical fi-8170 — including a
 186-card production run. Milestones M0–M2 are met.
 
 Still open: a job/profile editor (there is one built-in profile today), an app
-icon, accessibility passes, CI, and a supported-scanner matrix. There is no CI
-yet, so there is no build badge — `swift test` on your own machine is the honest
-signal.
+icon, accessibility passes, a downloadable release, and a supported-scanner
+matrix. Every one of those has an [issue](https://github.com/eliseorobles/ScanDeck/issues).
+
+CI runs `swift build` and `swift test -c release` on every pull request, plus a
+hygiene job that fails if a card scan or any private working file ever becomes
+tracked.
 
 ## Help make this the best scanning app on the Mac
 
