@@ -1,0 +1,43 @@
+.DS_Store
+xcuserdata/
+*.xcuserstate
+build/
+DerivedData/
+.build/
+ScanDeck.app/
+.swiftpm/
+*.xcresult
+m0-output-*/
+.env
+
+# The centering tool (D-11 / TICKET-034). It lives here for convenience and
+# must never reach GitHub: this repository has a live public remote, so a
+# stray commit is one push from publishing it. The pre-commit guard in
+# .githooks/ is the other half — this line handles the ordinary commit, the
+# guard handles the one hurried `git add -f` on a day nobody is thinking
+# about it.
+centering/
+
+# Internal working documents. They stay on the operator's machine because they
+# are a private engineering diary rather than product documentation: the ticket
+# queue records commercial rationale, real batch and consignor names, the
+# destination Drive folder, and third-party integration detail that is nobody
+# else's to publish. SPEC.md is the public contract; CONTRIBUTING.md is the
+# public working agreement. Those two are what a contributor actually needs.
+CLAUDE.md
+PENDINGTICKETS.md
+
+# A dense, page-cited distillation of PFU's copyrighted 644-page user guide.
+# The individual facts are functional and uncopyrightable, but the selection and
+# arrangement are a derivative of one source, and nothing in ScanDeck needs it
+# published to be useful.
+docs/research/paperstream-capture-inventory.md
+
+# The broader UX study of a general-purpose PaperStream Capture remake. It is
+# local research, not part of the product: it uses PFU's trademark as the
+# working name of the proposed app — in its title, in draft error copy, in a
+# menu item and in a wireframe's title bar — which is branding use rather than
+# the nominative use everything else in this repository sticks to. ScanDeck is
+# not that app and never was, so publishing it would put someone else's mark on
+# a product surface for no benefit. Kept locally as a UX quality bar.
+PaperStream_for_Mac_UI_Spec_v1.0.docx.md

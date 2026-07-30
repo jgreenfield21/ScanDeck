@@ -1,0 +1,19 @@
+#!/bin/sh
+
+set -eu
+
+protected_paths="$(
+    git diff --cached --name-only --diff-filter=ACMR -- centering/
+)"
+
+if [ -n "$protected_paths" ]; then
+    cat >&2 <<'EOF'
+Commit refused: centering/ is private operator tooling and must never be committed.
+
+The directory is intentionally ignored. If it was staged with `git add -f`,
+remove it from the index before committing:
+
+    git restore --staged -- centering/
+EOF
+    exit 1
+fi
