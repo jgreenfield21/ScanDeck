@@ -75,6 +75,13 @@ struct ScanDeckApp: App {
                 .frame(minWidth: 1_040, minHeight: 720)
         }
         .defaultSize(width: 1_280, height: 820)
+        .windowStyle(.titleBar)
+        // Keep the title and toolbar in one system-managed row. The expanded
+        // two-row style can restore a NavigationSplitView with its first list
+        // rows inside the upper title-bar band, leaving them clipped above the
+        // scrollable region. Unified gives every column one stable safe-area
+        // boundary below the window controls.
+        .windowToolbarStyle(.unified)
         .windowResizability(.contentMinSize)
         .commands {
             ScanDeckCommands(model: model)

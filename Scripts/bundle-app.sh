@@ -40,6 +40,7 @@ rm -rf "$APP_PATH"
 mkdir -p "$CONTENTS_PATH/MacOS" "$CONTENTS_PATH/Resources"
 cp "$BINARY_PATH" "$CONTENTS_PATH/MacOS/ScanDeck"
 cp "$REPOSITORY_ROOT/Resources/ScanDeck-Info.plist" "$CONTENTS_PATH/Info.plist"
+cp "$REPOSITORY_ROOT/Resources/ScanDeck.icns" "$CONTENTS_PATH/Resources/ScanDeck.icns"
 
 # TICKET-034's implementation is private operator tooling: it is deliberately
 # ignored by Git, but the local app bundle still needs a stable, direct path to

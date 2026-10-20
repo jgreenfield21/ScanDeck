@@ -8,6 +8,8 @@
     <string>ScanDeck</string>
     <key>CFBundleIdentifier</key>
     <string>me.eliseorobles.ScanDeck</string>
+    <key>CFBundleIconFile</key>
+    <string>ScanDeck.icns</string>
     <key>CFBundleName</key>
     <string>ScanDeck</string>
     <key>CFBundlePackageType</key>
