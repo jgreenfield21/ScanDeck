@@ -758,7 +758,7 @@ public final class ImageCaptureScannerProbe: NSObject,
         )
         emit("Reverse feeder page order: \(feeder.reverseFeederPageOrder ? "yes" : "no").")
 
-        try configurePFUVendorFeatures(on: feeder)
+        try configurePFUVendorFeatures(on: feeder, scanner: scanner)
     }
 
     /// Dumps everything the driver will say about the shape of a scan.
@@ -1001,7 +1001,8 @@ public final class ImageCaptureScannerProbe: NSObject,
     }
 
     private func configurePFUVendorFeatures(
-        on feeder: ICScannerFunctionalUnitDocumentFeeder
+        on feeder: ICScannerFunctionalUnitDocumentFeeder,
+        scanner: ICScannerDevice
     ) throws {
         describeAllVendorFeatures(on: feeder)
 
@@ -1019,9 +1020,36 @@ public final class ImageCaptureScannerProbe: NSObject,
             emit("  \(feature.internalName): [\(options)] current=\(feature.currentRawValue.map(String.init) ?? "?")")
         }
 
-        let selections = PFUCardScannerProfile.selections(
-            croppingMode: configuration.croppingMode
-        )
+        let isFi7030 = scanner.usbVendorID == 0x04c5
+            && scanner.usbProductID == 0x151f
+
+        let hasPrepick = snapshots.contains {
+            PFUCardScannerProfile.canonicalInternalName($0.internalName) == "prepick"
+        }
+
+        let selections: [VendorFeatureSelection] =
+            PFUCardScannerProfile.selections(
+                croppingMode: configuration.croppingMode
+            ).compactMap { selection in
+                guard isFi7030 else { return selection }
+
+                if selection.internalName == "prepick", !hasPrepick {
+                    emit("Experimental fi-7030: pre-pick is unavailable; its state cannot be verified.")
+                    return nil
+                }
+
+                if selection.internalName == "cropping" {
+                    return VendorFeatureSelection(
+                        internalName: "cropping",
+                        rawValue: configuration.croppingMode == .overscan ? 2 : 0,
+                        purpose: configuration.croppingMode == .overscan
+                            ? "Overscan for real background around the media"
+                            : "None (background must be checked on actual scans)"
+                    )
+                }
+
+                return selection
+            }
         for selection in selections {
             let option = try PFUCardScannerProfile.resolve(selection, in: snapshots)
 

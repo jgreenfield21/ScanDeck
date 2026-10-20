@@ -4,6 +4,7 @@ import SwiftUI
 
 struct BatchWorkspaceView: View {
     @Bindable var model: ScanDeckPresentationModel
+    @State private var cropEditor: ManualCropEditorRequest?
 
     private var batch: ActiveBatchViewData? {
         model.activeBatch
@@ -37,11 +38,30 @@ struct BatchWorkspaceView: View {
                 )
             }
         }
+        .sheet(item: $cropEditor) { request in
+            ManualCropEditorView(
+                request: request,
+                apply: { crop in
+                    model.setManualCrop(
+                        cardID: request.cardID,
+                        side: request.side,
+                        crop: crop
+                    )
+                },
+                reset: {
+                    model.setManualCrop(
+                        cardID: request.cardID,
+                        side: request.side,
+                        crop: nil
+                    )
+                }
+            )
+        }
     }
 
     private func cardList(_ batch: ActiveBatchViewData) -> some View {
         ScrollViewReader { proxy in
-            ScrollView {
+            ScrollView(.vertical, showsIndicators: true) {
                     LazyVStack(spacing: 18) {
                         BatchWorkspaceHeader(batch: batch)
 
@@ -71,6 +91,17 @@ struct BatchWorkspaceView: View {
                                     },
                                     rotate: { side in
                                         model.rotate(cardID: card.id, side: side)
+                                    },
+                                    editCrop: { side in
+                                        guard let scan = side == .front ? card.front : card.back else {
+                                            return
+                                        }
+                                        cropEditor = ManualCropEditorRequest(
+                                            cardID: card.id,
+                                            cardNumber: card.sheetNumber,
+                                            side: side,
+                                            scan: scan
+                                        )
                                     },
                                     deleteSide: { side in
                                         model.deleteSide(cardID: card.id, side: side)
@@ -517,6 +548,7 @@ private struct CardPairRow: View {
     let scanInProgress: Bool
     let select: () -> Void
     let rotate: (OutputSide) -> Void
+    let editCrop: (OutputSide) -> Void
     let deleteSide: (OutputSide) -> Void
     let retry: () -> Void
     let replace: () -> Void
@@ -637,6 +669,7 @@ private struct CardPairRow: View {
                     side: .front,
                     scan: card.front,
                     disabled: scanInProgress,
+                    editCrop: { editCrop(.front) },
                     rotate: { rotate(.front) },
                     delete: { deleteSide(.front) }
                 )
@@ -645,6 +678,7 @@ private struct CardPairRow: View {
                     side: .back,
                     scan: card.back,
                     disabled: scanInProgress,
+                    editCrop: { editCrop(.back) },
                     rotate: { rotate(.back) },
                     delete: { deleteSide(.back) }
                 )
@@ -670,7 +704,10 @@ private struct CardPairRow: View {
         }
         .shadow(color: .black.opacity(0.045), radius: 8, y: 3)
         .contentShape(RoundedRectangle(cornerRadius: 20))
-        .onTapGesture(perform: select)
+        // Row selection must coexist with the enclosing ScrollView's gesture.
+        // A regular onTapGesture across the whole row can win recognition on
+        // macOS and make trackpad or click-drag scrolling appear disabled.
+        .simultaneousGesture(TapGesture().onEnded(select))
         .contextMenu {
             if card.isIncomplete {
                 Button("Retry Card", systemImage: "arrow.clockwise", action: retry)
@@ -684,6 +721,14 @@ private struct CardPairRow: View {
             .disabled(card.front == nil)
             Button("Rotate Back", systemImage: "rotate.right") {
                 rotate(.back)
+            }
+            .disabled(card.back == nil)
+            Button("Crop Front…", systemImage: "crop") {
+                editCrop(.front)
+            }
+            .disabled(card.front == nil)
+            Button("Crop Back…", systemImage: "crop") {
+                editCrop(.back)
             }
             .disabled(card.back == nil)
             Divider()
@@ -702,6 +747,7 @@ private struct ScanSideCard: View {
     let side: OutputSide
     let scan: ScanSideViewData?
     let disabled: Bool
+    let editCrop: () -> Void
     let rotate: () -> Void
     let delete: () -> Void
 
@@ -715,6 +761,11 @@ private struct ScanSideCard: View {
                     .foregroundStyle(.secondary)
                 Spacer()
                 if let scan {
+                    if scan.manualCrop != nil {
+                        Label("Manual", systemImage: "crop")
+                            .font(.caption2.weight(.semibold))
+                            .foregroundStyle(.blue)
+                    }
                     MarginStatusBadge(state: scan.marginAssessment)
                 } else {
                     Label("Missing", systemImage: "exclamationmark.circle.fill")
@@ -737,6 +788,13 @@ private struct ScanSideCard: View {
                 if scan != nil, isHovering {
                     GlassEffectContainer(spacing: 7) {
                         HStack(spacing: 7) {
+                            Button(action: editCrop) {
+                                Label("Crop \(side.title)", systemImage: "crop")
+                            }
+                            .labelStyle(.iconOnly)
+                            .buttonStyle(.glass)
+                            .help("Crop \(side.title)…")
+
                             Button(action: rotate) {
                                 Label("Rotate \(side.title)", systemImage: "rotate.right")
                             }

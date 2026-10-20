@@ -23,6 +23,7 @@ public enum SupportedScanner {
     public static let usbIdentities: Set<USBIdentity> = [
         USBIdentity(vendorID: 0x04c5, productID: 0x15ff),
         USBIdentity(vendorID: 0x05ca, productID: 0x03d8),
+        USBIdentity(vendorID: 0x04c5, productID: 0x151f),
     ]
 
     public static func isSupported(vendorID: Int, productID: Int) -> Bool {

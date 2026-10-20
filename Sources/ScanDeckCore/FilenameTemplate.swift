@@ -12,11 +12,17 @@ import Foundation
 public struct FilenameTemplate: Codable, Hashable, Sendable {
     public static let sheetCounterToken = "<SheetCounter>"
     public static let outputSideToken = "<OutputSide>"
+    public static let outputSideNameToken = "<OutputSideName>"
     public static let sheetCounterWidth = 6
 
     /// `scan_<SheetCounter>_<OutputSide>.jpg`
     public static let cardDefault = FilenameTemplate(
         unchecked: "scan_\(sheetCounterToken)_\(outputSideToken).jpg"
+    )
+
+    /// `scan_<SheetCounter>-front.jpg` / `scan_<SheetCounter>-back.jpg`
+    public static let descriptiveSides = FilenameTemplate(
+        unchecked: "scan_\(sheetCounterToken)-\(outputSideNameToken).jpg"
     )
 
     public let rawValue: String
@@ -25,7 +31,9 @@ public struct FilenameTemplate: Codable, Hashable, Sendable {
         guard rawValue.contains(Self.sheetCounterToken) else {
             throw ValidationError.missingSheetCounter
         }
-        guard rawValue.contains(Self.outputSideToken) else {
+        guard rawValue.contains(Self.outputSideToken)
+                || rawValue.contains(Self.outputSideNameToken)
+        else {
             throw ValidationError.missingOutputSide
         }
 
@@ -85,6 +93,10 @@ public struct FilenameTemplate: Codable, Hashable, Sendable {
                 of: outputSideToken,
                 with: side.rawValue
             )
+            .replacingOccurrences(
+                of: outputSideNameToken,
+                with: side.filenameWord
+            )
     }
 
     public enum ValidationError: Error, Equatable, LocalizedError, Sendable {
@@ -99,12 +111,22 @@ public struct FilenameTemplate: Codable, Hashable, Sendable {
                 "The filename template must include \(FilenameTemplate.sheetCounterToken)."
             case .missingOutputSide:
                 "The filename template must include \(FilenameTemplate.outputSideToken) "
+                    + "or \(FilenameTemplate.outputSideNameToken) "
                     + "so front and back files do not collide."
             case .rendersEmptyName:
                 "This filename template produces an empty name."
             case .forbiddenCharacter:
                 "Filenames cannot contain \\/:*?\"<>| or control characters."
             }
+        }
+    }
+}
+
+private extension OutputSide {
+    var filenameWord: String {
+        switch self {
+        case .front: "front"
+        case .back: "back"
         }
     }
 }

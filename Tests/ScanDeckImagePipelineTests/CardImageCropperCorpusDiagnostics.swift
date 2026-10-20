@@ -16,7 +16,9 @@ import Testing
 ///
 /// Opt-in, and the images are never committed — point `SCANDECK_CORPUS_DIR` at
 /// a directory of `_F`/`_B` pairs (symlinks are fine) and
-/// `SCANDECK_CORPUS_REPORT` at the CSV to write.
+/// `SCANDECK_CORPUS_REPORT` at the CSV to write. Set
+/// `SCANDECK_CORPUS_EXPORT_DIR` to also render the detector's current crops for
+/// visual inspection.
 @Suite("Real-corpus detector diagnostics")
 struct CardImageCropperCorpusDiagnostics {
     @Test(
@@ -94,6 +96,30 @@ struct CardImageCropperCorpusDiagnostics {
         }
         try lines.joined(separator: "\n").appending("\n")
             .write(to: reportURL, atomically: true, encoding: .utf8)
+
+        if let exportPath = ProcessInfo.processInfo
+            .environment["SCANDECK_CORPUS_EXPORT_DIR"]
+        {
+            let exportDirectory = URL(
+                fileURLWithPath: exportPath,
+                isDirectory: true
+            )
+            try FileManager.default.createDirectory(
+                at: exportDirectory,
+                withIntermediateDirectories: true
+            )
+            let cropper = CardImageCropper()
+            for job in jobs {
+                _ = try cropper.crop(
+                    sourceURL: job.url,
+                    destinationURL: exportDirectory.appendingPathComponent(
+                        "\(job.pair)_\(job.side).jpg"
+                    ),
+                    margins: try ScanMargins(all: 2),
+                    dpi: 600
+                )
+            }
+        }
 
         // The instrumented replica must reproduce the shipping detector
         // exactly, or every number in the report describes a different
@@ -185,9 +211,13 @@ struct SideDiagnostics: Sendable {
                         abs(primary.maxY - stronger.maxY),
                     ].max() ?? 0
                 }
-                chosenRead = analysis.mediaBounds == primary
-                    ? "permissive"
-                    : "conservative"
+                chosenRead = if analysis.mediaBounds == primary {
+                    "permissive"
+                } else if analysis.mediaBounds == conservative?.rect {
+                    "conservative"
+                } else {
+                    "mixed"
+                }
             }
         } catch {
             self.error = "\(error)"
@@ -391,6 +421,14 @@ struct DetectionTrace: Sendable {
         // below record what a faint-fringe pass *would* have added, which is
         // how the decision to drop it stays re-checkable against new media.
         supportedBounds = floorBounds
+        if min(background.red, background.green, background.blue) >= 224 {
+            supportedBounds = cropper.supportedBounds(
+                mask: mask,
+                width: maskWidth,
+                height: maskHeight,
+                dpi: dpi
+            )
+        }
         fringeGainTop = rowsTop.floor - rowsTop.fringe
         fringeGainBottom = rowsBottom.fringe - rowsBottom.floor
         fringeGainLeft = columnsLeft.floor - columnsLeft.fringe

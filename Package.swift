@@ -48,7 +48,8 @@ let package = Package(
             linkerSettings: [
                 .linkedFramework("CoreGraphics"),
                 .linkedFramework("ImageIO"),
-                .linkedFramework("UniformTypeIdentifiers")
+                .linkedFramework("UniformTypeIdentifiers"),
+                .linkedFramework("Vision")
             ]
         ),
         .executableTarget(

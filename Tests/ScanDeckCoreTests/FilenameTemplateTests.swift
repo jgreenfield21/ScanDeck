@@ -18,6 +18,14 @@ struct FilenameTemplateTests {
         )
     }
 
+    @Test("Renders descriptive front and back names")
+    func rendersDescriptiveSideNames() {
+        let template = FilenameTemplate.descriptiveSides
+
+        #expect(template.render(sheetNumber: 114, side: .front) == "scan_000114-front.jpg")
+        #expect(template.render(sheetNumber: 114, side: .back) == "scan_000114-back.jpg")
+    }
+
     @Test("Zero-pads to six digits and grows beyond them")
     func padsToSixDigits() {
         let template = FilenameTemplate.cardDefault

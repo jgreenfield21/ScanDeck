@@ -28,6 +28,22 @@ import Foundation
 /// all four by the same angle, so their spread is the error bar, and
 /// `isTrustworthy` is what the crop consults before it resamples anything.
 struct MediaTiltEstimator {
+    struct EdgeThresholds: Sendable, Equatable {
+        let left: UInt8
+        let right: UInt8
+        let top: UInt8
+        let bottom: UInt8
+
+        static func uniform(_ threshold: UInt8) -> Self {
+            Self(
+                left: threshold,
+                right: threshold,
+                top: threshold,
+                bottom: threshold
+            )
+        }
+    }
+
     /// One edge's fitted line.
     struct EdgeFit: Sendable, Equatable {
         /// `dx/dy` for the left and right edges, `dy/dx` for top and bottom.
@@ -229,7 +245,25 @@ struct MediaTiltEstimator {
         background: (red: UInt8, green: UInt8, blue: UInt8),
         threshold: UInt8
     ) -> Reading {
-        func foreground(_ x: Int, _ y: Int) -> Bool {
+        measure(
+            pixels: pixels,
+            width: width,
+            height: height,
+            bounds: bounds,
+            background: background,
+            thresholds: .uniform(threshold)
+        )
+    }
+
+    static func measure(
+        pixels: [UInt8],
+        width: Int,
+        height: Int,
+        bounds: PixelRect,
+        background: (red: UInt8, green: UInt8, blue: UInt8),
+        thresholds: EdgeThresholds
+    ) -> Reading {
+        func foreground(_ x: Int, _ y: Int, threshold: UInt8) -> Bool {
             guard x >= 0, x < width, y >= 0, y < height else { return false }
             let offset = (y * width + x) * 4
             let signal = max(
@@ -257,7 +291,7 @@ struct MediaTiltEstimator {
                     from: max(0, bounds.x - requiredRun * 2),
                     through: min(width - 1, bounds.x + verticalBand),
                     step: 1,
-                    isForeground: { foreground($0, y) }
+                    isForeground: { foreground($0, y, threshold: thresholds.left) }
                 ) {
                     leftSamples.append((along: y, across: x))
                 }
@@ -265,7 +299,7 @@ struct MediaTiltEstimator {
                     from: min(width - 1, bounds.maxX - 1 + requiredRun * 2),
                     through: max(0, bounds.maxX - 1 - verticalBand),
                     step: -1,
-                    isForeground: { foreground($0, y) }
+                    isForeground: { foreground($0, y, threshold: thresholds.right) }
                 ) {
                     rightSamples.append((along: y, across: x))
                 }
@@ -280,7 +314,7 @@ struct MediaTiltEstimator {
                     from: max(0, bounds.y - requiredRun * 2),
                     through: min(height - 1, bounds.y + horizontalBand),
                     step: 1,
-                    isForeground: { foreground(x, $0) }
+                    isForeground: { foreground(x, $0, threshold: thresholds.top) }
                 ) {
                     topSamples.append((along: x, across: y))
                 }
@@ -288,7 +322,7 @@ struct MediaTiltEstimator {
                     from: min(height - 1, bounds.maxY - 1 + requiredRun * 2),
                     through: max(0, bounds.maxY - 1 - horizontalBand),
                     step: -1,
-                    isForeground: { foreground(x, $0) }
+                    isForeground: { foreground(x, $0, threshold: thresholds.bottom) }
                 ) {
                     bottomSamples.append((along: x, across: y))
                 }

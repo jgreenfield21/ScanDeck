@@ -113,3 +113,25 @@ public struct PixelInsets: Codable, Equatable, Sendable {
         self.left = left
     }
 }
+
+/// A card-edge rectangle expressed as fractions of its unrotated master image.
+/// Normalized coordinates keep a manual choice independent of preview size.
+public struct ManualCropRect: Codable, Equatable, Hashable, Sendable {
+    public let x: Double
+    public let y: Double
+    public let width: Double
+    public let height: Double
+
+    public init(x: Double, y: Double, width: Double, height: Double) {
+        self.x = x
+        self.y = y
+        self.width = width
+        self.height = height
+    }
+
+    public var isValid: Bool {
+        x.isFinite && y.isFinite && width.isFinite && height.isFinite
+            && x >= 0 && y >= 0 && width > 0 && height > 0
+            && x + width <= 1 && y + height <= 1
+    }
+}

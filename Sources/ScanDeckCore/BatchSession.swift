@@ -223,6 +223,11 @@ public enum MarginAssessment: Codable, Equatable, Sendable {
     /// field, which forgoes the pair check rather than inventing a size.
     case sufficient(mediaSize: MediaPixelSize?)
     case insufficient(edges: Set<ScanEdge>)
+
+    public var mediaSize: MediaPixelSize? {
+        guard case let .sufficient(size) = self else { return nil }
+        return size
+    }
 }
 
 public struct ScannedSide: Codable, Equatable, Sendable {
@@ -230,17 +235,20 @@ public struct ScannedSide: Codable, Equatable, Sendable {
     public let captureSequence: UInt64
     public internal(set) var rotation: QuarterTurns
     public internal(set) var marginAssessment: MarginAssessment
+    public internal(set) var manualCrop: ManualCropRect?
 
     public init(
         masterID: MasterID,
         captureSequence: UInt64,
         rotation: QuarterTurns = .zero,
-        marginAssessment: MarginAssessment = .pending
+        marginAssessment: MarginAssessment = .pending,
+        manualCrop: ManualCropRect? = nil
     ) {
         self.masterID = masterID
         self.captureSequence = captureSequence
         self.rotation = rotation
         self.marginAssessment = marginAssessment
+        self.manualCrop = manualCrop
     }
 }
 
@@ -341,6 +349,17 @@ public struct BatchCard: Identifiable, Codable, Equatable, Sendable {
             return nil
         }
         return (frontSize, backSize)
+    }
+
+    /// Whether a person explicitly chose at least one of this card's bounds.
+    /// A manual crop is the authoritative item boundary, so the automatic
+    /// front/back footprint comparison must not overrule it afterward.
+    public var hasManualCrop: Bool {
+        guard let activeSides else {
+            return false
+        }
+        return activeSides.front?.manualCrop != nil
+            || activeSides.back?.manualCrop != nil
     }
 
     /// Whether the operator's acceptance still describes what this card
@@ -594,6 +613,20 @@ public enum BatchPhase: Codable, Equatable, Sendable {
 public struct CompletionSide: Codable, Equatable, Sendable {
     public let masterID: MasterID
     public let rotation: QuarterTurns
+    public let manualCrop: ManualCropRect?
+    public let mediaSize: MediaPixelSize?
+
+    public init(
+        masterID: MasterID,
+        rotation: QuarterTurns,
+        manualCrop: ManualCropRect? = nil,
+        mediaSize: MediaPixelSize? = nil
+    ) {
+        self.masterID = masterID
+        self.rotation = rotation
+        self.manualCrop = manualCrop
+        self.mediaSize = mediaSize
+    }
 }
 
 public struct CompletionCard: Identifiable, Codable, Equatable, Sendable {
@@ -617,6 +650,7 @@ public enum BatchEffect: Equatable, Sendable {
     case assessMargin(
         masterID: MasterID,
         rotation: QuarterTurns,
+        manualCrop: ManualCropRect?,
         requestedMargins: ScanMargins
     )
     /// Marks masters as retired from the current review graph. The storage
@@ -644,6 +678,11 @@ public enum BatchAction: Sendable {
         rotation: QuarterTurns,
         result: MarginAssessment
     )
+    case automaticallyOrient(
+        masterID: MasterID,
+        expectedRotation: QuarterTurns,
+        rotation: QuarterTurns
+    )
     case scanEnded(passID: ScanPassID, outcome: ScanOutcome)
     case recoverInterruptedScan
     case rotate(
@@ -651,6 +690,7 @@ public enum BatchAction: Sendable {
         side: OutputSide,
         direction: RotationDirection
     )
+    case setManualCrop(cardID: CardID, side: OutputSide, crop: ManualCropRect?)
     case deleteSide(cardID: CardID, side: OutputSide)
     case deleteCard(cardID: CardID)
     /// The operator's decision to publish a card whose two sides disagree past
@@ -855,6 +895,7 @@ public struct BatchSession: Codable, Equatable, Sendable {
     public var pairSizeWarnings: [PairSizeWarning] {
         cards.compactMap { card in
             guard !card.isDeleted,
+                  !card.hasManualCrop,
                   let sizes = card.assessedPairSizes,
                   !sizes.front.agrees(with: sizes.back)
             else {
@@ -1048,6 +1089,13 @@ private extension BatchSession {
                 result: result
             )
 
+        case let .automaticallyOrient(masterID, expectedRotation, rotation):
+            return try automaticallyOrient(
+                masterID: masterID,
+                expectedRotation: expectedRotation,
+                rotation: rotation
+            )
+
         case let .scanEnded(passID, outcome):
             return try endScan(passID: passID, outcome: outcome)
 
@@ -1060,6 +1108,9 @@ private extension BatchSession {
                 side: side,
                 direction: direction
             )
+
+        case let .setManualCrop(cardID, side, crop):
+            return try setManualCrop(cardID: cardID, side: side, crop: crop)
 
         case let .deleteSide(cardID, side):
             return try deleteSide(cardID: cardID, side: side)
@@ -1268,6 +1319,7 @@ private extension BatchSession {
             .assessMargin(
                 masterID: masterID,
                 rotation: scannedSide.rotation,
+                manualCrop: nil,
                 requestedMargins: requestedMargins
             )
         ]
@@ -1347,6 +1399,81 @@ private extension BatchSession {
 
         phase = .scanning(activePass)
         return []
+    }
+
+    mutating func automaticallyOrient(
+        masterID: MasterID,
+        expectedRotation: QuarterTurns,
+        rotation: QuarterTurns
+    ) throws -> [BatchEffect] {
+        func effect(for side: ScannedSide) -> BatchEffect {
+            .assessMargin(
+                masterID: side.masterID,
+                rotation: side.rotation,
+                manualCrop: side.manualCrop,
+                requestedMargins: requestedMargins
+            )
+        }
+
+        for index in cards.indices {
+            guard case var .active(sides) = cards[index].disposition else { continue }
+            for outputSide in [OutputSide.front, .back] {
+                guard var side = sides[outputSide], side.masterID == masterID else { continue }
+                guard side.rotation == expectedRotation else { return [] }
+                guard rotation != expectedRotation else { return [] }
+                let delta = (rotation.rawValue - expectedRotation.rawValue + 4) % 4
+                side.rotation = rotation
+                side.marginAssessment = .pending
+                sides[outputSide] = side
+                var changed = [side]
+                let partnerSide: OutputSide = outputSide == .front ? .back : .front
+                if var partner = sides[partnerSide],
+                   let partnerRotation = QuarterTurns(
+                    // The reverse image from the duplex transport is physically
+                    // inverted relative to the first image. Preserve the
+                    // detected correction, then add the half-turn required to
+                    // make the opposite face upright.
+                    rawValue: (partner.rotation.rawValue + delta + 2) % 4
+                   ) {
+                    partner.rotation = partnerRotation
+                    partner.marginAssessment = .pending
+                    sides[partnerSide] = partner
+                    changed.append(partner)
+                }
+                cards[index].disposition = .active(sides)
+                return changed.map(effect)
+            }
+        }
+
+        guard case var .scanning(activePass) = phase else {
+            throw BatchSessionError.masterNotReferenced(masterID)
+        }
+        switch activePass.operation {
+        case .append:
+            throw BatchSessionError.masterNotReferenced(masterID)
+        case let .retry(target, staged):
+            guard let index = staged.firstIndex(where: { $0.masterID == masterID }) else {
+                throw BatchSessionError.masterNotReferenced(masterID)
+            }
+            guard staged[index].rotation == expectedRotation else { return [] }
+            var updated = staged
+            updated[index].rotation = rotation
+            if rotation != expectedRotation { updated[index].marginAssessment = .pending }
+            activePass.operation = .retry(target: target, staged: updated)
+            phase = .scanning(activePass)
+            return rotation == expectedRotation ? [] : [effect(for: updated[index])]
+        case let .replace(target, staged):
+            guard let index = staged.firstIndex(where: { $0.masterID == masterID }) else {
+                throw BatchSessionError.masterNotReferenced(masterID)
+            }
+            guard staged[index].rotation == expectedRotation else { return [] }
+            var updated = staged
+            updated[index].rotation = rotation
+            if rotation != expectedRotation { updated[index].marginAssessment = .pending }
+            activePass.operation = .replace(target: target, staged: updated)
+            phase = .scanning(activePass)
+            return rotation == expectedRotation ? [] : [effect(for: updated[index])]
+        }
     }
 
     mutating func endScan(
@@ -1471,6 +1598,37 @@ private extension BatchSession {
             .assessMargin(
                 masterID: scannedSide.masterID,
                 rotation: scannedSide.rotation,
+                manualCrop: scannedSide.manualCrop,
+                requestedMargins: requestedMargins
+            )
+        ]
+    }
+
+    mutating func setManualCrop(
+        cardID: CardID,
+        side: OutputSide,
+        crop: ManualCropRect?
+    ) throws -> [BatchEffect] {
+        try requireReviewPhase()
+        if let crop, !crop.isValid {
+            throw BatchSessionError.invalidState("The manual crop is outside the master image.")
+        }
+        let index = try activeCardIndex(for: cardID)
+        guard case var .active(sides) = cards[index].disposition,
+              var scannedSide = sides[side]
+        else {
+            throw BatchSessionError.sideNotPresent(cardID: cardID, side: side)
+        }
+        scannedSide.manualCrop = crop
+        scannedSide.marginAssessment = .pending
+        sides[side] = scannedSide
+        cards[index].disposition = .active(sides)
+        cards[index].acceptedPairSizeMismatch = nil
+        return [
+            .assessMargin(
+                masterID: scannedSide.masterID,
+                rotation: scannedSide.rotation,
+                manualCrop: crop,
                 requestedMargins: requestedMargins
             )
         ]
@@ -1647,11 +1805,15 @@ private extension BatchSession {
                 provisionalSheetNumber: card.provisionalSheetNumber,
                 front: CompletionSide(
                     masterID: front.masterID,
-                    rotation: front.rotation
+                    rotation: front.rotation,
+                    manualCrop: front.manualCrop,
+                    mediaSize: front.marginAssessment.mediaSize
                 ),
                 back: CompletionSide(
                     masterID: back.masterID,
-                    rotation: back.rotation
+                    rotation: back.rotation,
+                    manualCrop: back.manualCrop,
+                    mediaSize: back.marginAssessment.mediaSize
                 )
             )
         }
@@ -1781,7 +1943,8 @@ private extension BatchSession {
             // re-measures the pair, and consent must not survive onto numbers
             // nobody was shown. The card stays in `pairSizeWarnings` either
             // way, so accepting silences the *refusal* and never the check.
-            if let sizes = card.assessedPairSizes,
+            if !card.hasManualCrop,
+               let sizes = card.assessedPairSizes,
                sizes.front.blocksCompletion(against: sizes.back),
                !card.hasLiveAcceptedPairSizeMismatch
             {

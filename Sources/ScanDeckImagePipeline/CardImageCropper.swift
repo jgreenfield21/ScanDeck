@@ -20,7 +20,7 @@ public struct PixelRect: Codable, Equatable, Hashable, Sendable {
     public var maxX: Int { x + width }
     public var maxY: Int { y + height }
 
-    fileprivate func intersection(width sourceWidth: Int, height sourceHeight: Int)
+    func intersection(width sourceWidth: Int, height sourceHeight: Int)
         -> PixelRect
     {
         let minimumX = max(0, x)
@@ -153,12 +153,24 @@ public struct CardImageCropper: Sendable {
     public func analyze(
         sourceURL: URL,
         margins: ScanMargins = .cardDefault,
-        dpi: Int = 600
+        dpi: Int = 600,
+        manualCrop: ManualCropRect? = nil,
+        pairedMediaSize: MediaPixelSize? = nil
     ) throws -> CropAnalysis {
-        try analyze(
-            decoded: try decode(sourceURL),
+        let decoded = try decode(sourceURL)
+        if let manualCrop {
+            return try analyzeManualCrop(
+                manualCrop,
+                decoded: decoded,
+                margins: margins,
+                dpi: dpi
+            )
+        }
+        return try analyze(
+            decoded: decoded,
             margins: margins,
-            dpi: dpi
+            dpi: dpi,
+            pairedMediaSize: pairedMediaSize
         )
     }
 
@@ -173,7 +185,8 @@ public struct CardImageCropper: Sendable {
     func analyze(
         decoded: DecodedImage,
         margins: ScanMargins,
-        dpi: Int
+        dpi: Int,
+        pairedMediaSize: MediaPixelSize? = nil
     ) throws -> CropAnalysis {
         let requestedInsets = try margins.pixels(atDPI: dpi)
         let background = estimateBackground(
@@ -188,16 +201,49 @@ public struct CardImageCropper: Sendable {
             )
         )
 
-        let primary = try detectBounds(
-            pixels: decoded.pixels,
-            width: decoded.width,
-            height: decoded.height,
-            background: background.color,
-            threshold: threshold,
-            dpi: dpi
-        )
+        let primary: PixelRect
+        let usedVisionFallback: Bool
+        do {
+            primary = try detectBounds(
+                pixels: decoded.pixels,
+                width: decoded.width,
+                height: decoded.height,
+                background: background.color,
+                threshold: threshold,
+                dpi: dpi
+            )
+            usedVisionFallback = false
+        } catch let error as CardImageCropperError
+            where error == .ambiguousMediaBounds || error == .noMediaDetected
+        {
+            if let pairedMediaSize,
+               let recovered = try? detectBounds(
+                   pixels: decoded.pixels,
+                   width: decoded.width,
+                   height: decoded.height,
+                   background: background.color,
+                   threshold: threshold,
+                   dpi: dpi,
+                   pairedMediaSize: pairedMediaSize
+               )
+            {
+                primary = recovered
+                usedVisionFallback = true
+            } else {
+            guard let recovered = try VisionMediaDetector.mediaBounds(
+                in: decoded.image,
+                dpi: dpi,
+                requiredInsets: requestedInsets,
+                pairedMediaSize: pairedMediaSize
+            ) else {
+                throw error
+            }
+            primary = recovered
+            usedVisionFallback = true
+            }
+        }
         let strongerThreshold = UInt8(min(255, max(24, Int(threshold) * 2)))
-        let stronger = try? detectBounds(
+        let stronger = usedVisionFallback ? nil : try? detectBounds(
             pixels: decoded.pixels,
             width: decoded.width,
             height: decoded.height,
@@ -218,50 +264,91 @@ public struct CardImageCropper: Sendable {
         // still genuine captured background, so invariant #2 holds either way.
         //
         // Past that line the two reads are not disagreeing about where an
-        // edge stopped being visible, they are disagreeing about what the
-        // media *is*. A smear broad enough to carry whole rows over the
-        // support floor at threshold 12 vanishes at 24 — measured:
+        // edge stopped being visible, they are disagreeing about what that
+        // edge *is*. A smear broad enough to carry whole rows over the support
+        // floor at threshold 12 vanishes at 24 — measured:
         // 1822 × 3972 px permissively against 1821 × 2417 px conservatively,
         // the latter matching the card's other side to a pixel. Three of the
-        // 372 sides land there, and all eight that moved even 16 px moved the
-        // same way round — the permissive read inflated, never the
-        // conservative one amputating — so the conservative read wins. The old
-        // behaviour, throwing, made a perfectly good scan unpublishable and
-        // told the operator all four margins were short.
+        // 372 sides land there, and all eight edges that moved even 16 px moved
+        // the same way round — the permissive read inflated, never the
+        // conservative one amputating — so the conservative read wins on that
+        // edge alone. Stable edges retain the permissive read. The old
+        // whole-rectangle choice needlessly tightened them, while the older
+        // behaviour of throwing made a perfectly good scan unpublishable.
         let consensusWindow = Self.maximumEdgeFadePixels(dpi: dpi)
-        let mediaBounds: PixelRect
+        let detectedMediaBounds: PixelRect
         let confidence: Double
         // Tracked so the tilt is fitted at the same threshold that produced
         // the bounds it is fitted inside. Measuring a conservative rect with
         // permissive pixels would read the artefact the consensus rule just
         // rejected.
-        let mediaThreshold: UInt8
+        let mediaThresholds: MediaTiltEstimator.EdgeThresholds
         if let stronger {
-            let maximumMovement = [
-                abs(primary.x - stronger.x),
-                abs(primary.y - stronger.y),
-                abs(primary.maxX - stronger.maxX),
-                abs(primary.maxY - stronger.maxY),
-            ].max() ?? 0
+            let consensus = Self.consensusBounds(
+                primary: primary,
+                stronger: stronger,
+                window: consensusWindow
+            )
 
-            if maximumMovement <= consensusWindow {
-                mediaBounds = primary
-                mediaThreshold = threshold
+            if consensus.maximumMovement <= consensusWindow {
+                detectedMediaBounds = consensus.bounds
+                mediaThresholds = .uniform(threshold)
                 confidence = max(
                     0.4,
-                    1 - Double(maximumMovement) / Double(consensusWindow + 1)
+                    1 - Double(consensus.maximumMovement)
+                        / Double(consensusWindow + 1)
                 )
             } else {
-                mediaBounds = stronger
-                mediaThreshold = strongerThreshold
+                // Threshold disagreement belongs to an edge, not to the whole
+                // rectangle. A scanner streak on the bottom must not make a
+                // faint but stable sleeve edge on the left use the stronger
+                // read too. Select each edge independently, and fit deskew at
+                // the same threshold that selected that edge.
+                detectedMediaBounds = consensus.bounds
+                mediaThresholds = MediaTiltEstimator.EdgeThresholds(
+                    left: consensus.strongerEdges.contains(.left)
+                        ? strongerThreshold : threshold,
+                    right: consensus.strongerEdges.contains(.right)
+                        ? strongerThreshold : threshold,
+                    top: consensus.strongerEdges.contains(.top)
+                        ? strongerThreshold : threshold,
+                    bottom: consensus.strongerEdges.contains(.bottom)
+                        ? strongerThreshold : threshold
+                )
                 // Reported low so review can single these out once there is a
                 // surface for it, rather than passing silently as a clean read.
                 confidence = 0.4
             }
         } else {
-            mediaBounds = primary
-            mediaThreshold = threshold
-            confidence = 0.72
+            detectedMediaBounds = primary
+            mediaThresholds = .uniform(threshold)
+            confidence = usedVisionFallback ? 0.55 : 0.72
+        }
+
+        // A duplex partner describes the same physical card or holder. When
+        // this side's automatic outline alone would run a requested margin out
+        // of the captured frame, retain its locally measured centre but borrow
+        // the partner's footprint. This applies to the threshold detector as
+        // well as Vision. We deliberately do not shift the result away from an
+        // edge: the local scan must still prove that its own background exists.
+        let mediaBounds: PixelRect
+        if let pairedMediaSize,
+           Self.lacksRequestedInsets(
+               detectedMediaBounds,
+               in: decoded.image,
+               insets: requestedInsets
+           ),
+           let paired = Self.boundsUsingPairedFootprint(
+               detectedMediaBounds,
+               pairedMediaSize: pairedMediaSize,
+               imageWidth: decoded.width,
+               imageHeight: decoded.height,
+               dpi: dpi
+           )
+        {
+            mediaBounds = paired
+        } else {
+            mediaBounds = detectedMediaBounds
         }
 
         // Tilt is measured here: after detection, on the original pixels, and
@@ -276,7 +363,7 @@ public struct CardImageCropper: Sendable {
             height: decoded.height,
             bounds: mediaBounds,
             background: background.color,
-            threshold: mediaThreshold
+            thresholds: mediaThresholds
         )
         let deskew = MediaTiltEstimator
             .correctableAngle(from: tiltReading)
@@ -406,6 +493,115 @@ public struct CardImageCropper: Sendable {
         )
     }
 
+    struct BoundsConsensus: Equatable {
+        let bounds: PixelRect
+        let strongerEdges: Set<ScanEdge>
+        let maximumMovement: Int
+    }
+
+    /// Reconciles the permissive and conservative reads one edge at a time.
+    ///
+    /// The old all-or-nothing choice made one contaminated edge tighten the
+    /// other three as collateral damage. Thresholding is monotonic, so a large
+    /// disagreement still chooses the stronger read on the suspect edge; edges
+    /// that agree retain the permissive read and its faint boundary pixels.
+    static func consensusBounds(
+        primary: PixelRect,
+        stronger: PixelRect,
+        window: Int
+    ) -> BoundsConsensus {
+        let movements: [(ScanEdge, Int)] = [
+            (.left, abs(primary.x - stronger.x)),
+            (.right, abs(primary.maxX - stronger.maxX)),
+            (.top, abs(primary.y - stronger.y)),
+            (.bottom, abs(primary.maxY - stronger.maxY)),
+        ]
+        let strongerEdges = Set(
+            movements.compactMap { edge, movement in
+                movement > window ? edge : nil
+            }
+        )
+        let minimumX = strongerEdges.contains(.left) ? stronger.x : primary.x
+        let maximumX = strongerEdges.contains(.right)
+            ? stronger.maxX : primary.maxX
+        let minimumY = strongerEdges.contains(.top) ? stronger.y : primary.y
+        let maximumY = strongerEdges.contains(.bottom)
+            ? stronger.maxY : primary.maxY
+
+        // Both inputs have already passed the detector's geometry guards. This
+        // is defensive against an unexpected crossing after mixing their edges.
+        let bounds: PixelRect
+        if minimumX < maximumX, minimumY < maximumY {
+            bounds = PixelRect(
+                x: minimumX,
+                y: minimumY,
+                width: maximumX - minimumX,
+                height: maximumY - minimumY
+            )
+        } else {
+            bounds = stronger
+        }
+        return BoundsConsensus(
+            bounds: bounds,
+            strongerEdges: strongerEdges,
+            maximumMovement: movements.map(\.1).max() ?? 0
+        )
+    }
+
+    static func lacksRequestedInsets(
+        _ bounds: PixelRect,
+        in image: CGImage,
+        insets: PixelInsets
+    ) -> Bool {
+        bounds.x < insets.left
+            || bounds.y < insets.top
+            || bounds.maxX + insets.right > image.width
+            || bounds.maxY + insets.bottom > image.height
+    }
+
+    static func boundsUsingPairedFootprint(
+        _ local: PixelRect,
+        pairedMediaSize: MediaPixelSize,
+        imageWidth: Int,
+        imageHeight: Int,
+        dpi: Int
+    ) -> PixelRect? {
+        guard pairedMediaSize.width > 0, pairedMediaSize.height > 0 else {
+            return nil
+        }
+
+        let directDifference = abs(local.width - pairedMediaSize.width)
+            + abs(local.height - pairedMediaSize.height)
+        let swappedDifference = abs(local.width - pairedMediaSize.height)
+            + abs(local.height - pairedMediaSize.width)
+        let target = directDifference <= swappedDifference
+            ? (width: pairedMediaSize.width, height: pairedMediaSize.height)
+            : (width: pairedMediaSize.height, height: pairedMediaSize.width)
+
+        // Refuse a corrupted partner measurement. These are intentionally a
+        // little wider than the detector's normal card/sleeve range so rigid
+        // holders remain eligible while a scan-frame-sized outline does not.
+        let short = min(target.width, target.height)
+        let long = max(target.width, target.height)
+        guard short >= Int(2.0 * Double(dpi)),
+              short <= Int(3.5 * Double(dpi)),
+              long >= Int(3.0 * Double(dpi)),
+              long <= Int(4.75 * Double(dpi))
+        else { return nil }
+
+        let centreX = Double(local.x) + Double(local.width) / 2
+        let centreY = Double(local.y) + Double(local.height) / 2
+        let paired = PixelRect(
+            x: Int((centreX - Double(target.width) / 2).rounded()),
+            y: Int((centreY - Double(target.height) / 2).rounded()),
+            width: target.width,
+            height: target.height
+        )
+        return paired.intersection(width: imageWidth, height: imageHeight) == paired
+            ? paired
+            : nil
+    }
+
     /// Writes a JPEG crop. Insufficient-margin scans are rejected unless this
     /// is explicitly a review preview, in which case the source intersection is
     /// written and the analysis remains marked non-publishable.
@@ -417,14 +613,27 @@ public struct CardImageCropper: Sendable {
         dpi: Int = 600,
         quality: Double = 0.95,
         rotation: QuarterTurns = .zero,
-        allowInsufficientPreview: Bool = false
+        allowInsufficientPreview: Bool = false,
+        exportBackground: ExportBackground = .original,
+        manualCrop: ManualCropRect? = nil,
+        pairedMediaSize: MediaPixelSize? = nil
     ) throws -> CropOutput {
         let decoded = try decode(sourceURL)
-        let analysis = try analyze(
-            decoded: decoded,
-            margins: margins,
-            dpi: dpi
-        )
+        let analysis = if let manualCrop {
+            try analyzeManualCrop(
+                manualCrop,
+                decoded: decoded,
+                margins: margins,
+                dpi: dpi
+            )
+        } else {
+            try analyze(
+                decoded: decoded,
+                margins: margins,
+                dpi: dpi,
+                pairedMediaSize: pairedMediaSize
+            )
+        }
         if !analysis.insufficientEdges.isEmpty, !allowInsufficientPreview {
             throw CardImageCropperError.insufficientRealBackground(
                 analysis.insufficientEdges
@@ -494,7 +703,13 @@ public struct CardImageCropper: Sendable {
         // Rotation is baked in here rather than written as EXIF orientation so
         // the published JPEG is correct in every consumer, including
         // carduploader.
-        let oriented = try rotate(cropped, by: rotation)
+        let prepared = try applyingExportBackground(
+            exportBackground,
+            to: cropped,
+            analysis: analysis,
+            cropBounds: cropBounds
+        )
+        let oriented = try rotate(prepared, by: rotation)
         CGImageDestinationAddImage(
             destination,
             oriented,
@@ -513,6 +728,119 @@ public struct CardImageCropper: Sendable {
 // tuning decision recorded in this file was argued from those intermediates;
 // a suite that can only see the final rect cannot re-derive them.
 extension CardImageCropper {
+    func analyzeManualCrop(
+        _ crop: ManualCropRect,
+        decoded: DecodedImage,
+        margins: ScanMargins,
+        dpi: Int
+    ) throws -> CropAnalysis {
+        guard crop.isValid else { throw CardImageCropperError.cannotCropImage }
+        let insets = try margins.pixels(atDPI: dpi)
+        let x = Int((crop.x * Double(decoded.width)).rounded())
+        let y = Int((crop.y * Double(decoded.height)).rounded())
+        let maxX = Int(((crop.x + crop.width) * Double(decoded.width)).rounded())
+        let maxY = Int(((crop.y + crop.height) * Double(decoded.height)).rounded())
+        let media = PixelRect(x: x, y: y, width: maxX - x, height: maxY - y)
+        guard media.width > 0, media.height > 0 else {
+            throw CardImageCropperError.cannotCropImage
+        }
+        let requested = PixelRect(
+            x: media.x - insets.left,
+            y: media.y - insets.top,
+            width: media.width + insets.left + insets.right,
+            height: media.height + insets.top + insets.bottom
+        )
+        let available = requested.intersection(width: decoded.width, height: decoded.height)
+
+        // Applying a manual crop is the operator's explicit approval of this
+        // side. Preserve as much of the requested background as the master
+        // actually contains, but do not turn that approved choice back into an
+        // automatic margin warning. Resetting the crop to automatic runs the
+        // normal detector and restores strict margin validation.
+        return CropAnalysis(
+            sourceWidth: decoded.width,
+            sourceHeight: decoded.height,
+            dpi: dpi,
+            mediaBounds: media,
+            requestedCropBounds: available,
+            availableCropBounds: available,
+            requestedInsets: insets,
+            insufficientEdges: [],
+            threshold: 0,
+            confidence: 1,
+            deskew: nil,
+            outputWidth: available.width,
+            outputHeight: available.height
+        )
+    }
+
+    /// Replaces only the published margin outside the detected rectangular
+    /// media footprint. The source master and every analysis result remain
+    /// untouched, and `.original` avoids an extra redraw entirely.
+    func applyingExportBackground(
+        _ background: ExportBackground,
+        to image: CGImage,
+        analysis: CropAnalysis,
+        cropBounds: PixelRect
+    ) throws -> CGImage {
+        guard background != .original else { return image }
+
+        let media: CGRect
+        if analysis.deskew != nil {
+            media = CGRect(
+                x: analysis.requestedInsets.left,
+                y: analysis.requestedInsets.bottom,
+                width: image.width
+                    - analysis.requestedInsets.left
+                    - analysis.requestedInsets.right,
+                height: image.height
+                    - analysis.requestedInsets.top
+                    - analysis.requestedInsets.bottom
+            )
+        } else {
+            let relativeX = analysis.mediaBounds.x - cropBounds.x
+            let relativeTop = analysis.mediaBounds.y - cropBounds.y
+            media = CGRect(
+                x: relativeX,
+                y: image.height - relativeTop - analysis.mediaBounds.height,
+                width: analysis.mediaBounds.width,
+                height: analysis.mediaBounds.height
+            )
+        }
+
+        guard media.width > 0, media.height > 0,
+              let context = CGContext(
+                  data: nil,
+                  width: image.width,
+                  height: image.height,
+                  bitsPerComponent: 8,
+                  bytesPerRow: 0,
+                  space: image.colorSpace ?? CGColorSpaceCreateDeviceRGB(),
+                  bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue
+                      | CGBitmapInfo.byteOrder32Big.rawValue
+              )
+        else {
+            throw CardImageCropperError.cannotCreateImageContext
+        }
+
+        let canvas = CGRect(x: 0, y: 0, width: image.width, height: image.height)
+        context.draw(image, in: canvas)
+        context.setFillColor(
+            background == .white
+                ? CGColor(gray: 1, alpha: 1)
+                : CGColor(gray: 0, alpha: 1)
+        )
+        context.fill(CGRect(x: 0, y: 0, width: canvas.width, height: media.minY))
+        context.fill(CGRect(x: 0, y: media.maxY, width: canvas.width, height: canvas.maxY - media.maxY))
+        context.fill(CGRect(x: 0, y: media.minY, width: media.minX, height: media.height))
+        context.fill(CGRect(x: media.maxX, y: media.minY, width: canvas.maxX - media.maxX, height: media.height))
+
+        guard let result = context.makeImage() else {
+            throw CardImageCropperError.cannotCropImage
+        }
+        return result
+    }
+
     /// Rotates the media square and crops to the requested margin in a single
     /// resample.
     ///
@@ -779,7 +1107,8 @@ extension CardImageCropper {
         height: Int,
         background: (red: UInt8, green: UInt8, blue: UInt8),
         threshold: UInt8,
-        dpi: Int
+        dpi: Int,
+        pairedMediaSize: MediaPixelSize? = nil
     ) throws -> PixelRect {
         let scale = 2
         let maskWidth = (width + scale - 1) / scale
@@ -834,19 +1163,125 @@ extension CardImageCropper {
         guard let dominant = viable.first else {
             throw CardImageCropperError.noMediaDetected
         }
-        if viable.count > 1,
-           viable[1].element.area * 2 >= dominant.element.area
-        {
-            throw CardImageCropperError.ambiguousMediaBounds
+        let isLightBackground = min(
+            background.red,
+            background.green,
+            background.blue
+        ) >= 224
+        let coarse: PixelRect
+        if isLightBackground {
+            // A white card border can disappear into a white scan bed, leaving
+            // its artwork, printing, and edge shadows as separate components.
+            // Rank-by-filled-area then selects an interior panel.  The envelope
+            // instead uses every supported row and column, so disconnected edge
+            // evidence encloses the printed components without blindly unioning
+            // isolated dust or streaks.
+            // Clear sleeves scatter thin reflections across the white scan bed.
+            // Those reflections can satisfy the deliberately low holder-edge
+            // occupancy floor all the way to the frame boundary. Localize the
+            // projection around the dominant printed region before looking for
+            // the enclosing sleeve, so distant glare cannot become an edge.
+            let sleeveAnchor = viable.first { candidate in
+                let rect = candidate.element.rect
+                let shorterSide = min(rect.width, rect.height)
+                let longerSide = max(rect.width, rect.height)
+                let centerX = rect.x + rect.width / 2
+                let centerY = rect.y + rect.height / 2
+                return longerSide > 0
+                    && Double(shorterSide) / Double(longerSide) >= 0.08
+                    && centerX >= maskWidth / 10
+                    && centerX <= maskWidth * 9 / 10
+                    && centerY >= maskHeight / 10
+                    && centerY <= maskHeight * 9 / 10
+            } ?? dominant
+            if let pairedMediaSize {
+                let anchor = PixelRect(
+                    x: sleeveAnchor.element.rect.x * scale,
+                    y: sleeveAnchor.element.rect.y * scale,
+                    width: sleeveAnchor.element.rect.width * scale,
+                    height: sleeveAnchor.element.rect.height * scale
+                )
+                if let paired = Self.boundsUsingPairedFootprint(
+                    anchor,
+                    pairedMediaSize: pairedMediaSize,
+                    imageWidth: width,
+                    imageHeight: height,
+                    dpi: dpi
+                ) {
+                    // The partner supplies physical size; this side's dominant
+                    // printed component supplies location. Do not refine this
+                    // rectangle back down to an interior artwork boundary.
+                    return paired
+                }
+            }
+            let sleeveRegion = pennySleeveSearchRegion(
+                around: sleeveAnchor.element.rect,
+                width: maskWidth,
+                height: maskHeight,
+                dpi: dpi,
+                maskScale: scale
+            )
+            var localizedMask = mask
+            for y in 0..<maskHeight {
+                let rowStart = y * maskWidth
+                for x in 0..<maskWidth
+                where x < sleeveRegion.x || x >= sleeveRegion.maxX
+                    || y < sleeveRegion.y || y >= sleeveRegion.maxY
+                {
+                    localizedMask[rowStart + x] = 0
+                }
+            }
+            guard let envelope = supportedBounds(
+                mask: localizedMask,
+                width: maskWidth,
+                height: maskHeight,
+                dpi: dpi
+            ) else {
+                throw CardImageCropperError.ambiguousMediaBounds
+            }
+            for candidate in viable
+            where candidate.element.area * 2 >= sleeveAnchor.element.area {
+                let rect = candidate.element.rect
+                let candidateCenterX = rect.x + rect.width / 2
+                let candidateCenterY = rect.y + rect.height / 2
+                // The localized search deliberately excludes remote sleeve
+                // glare. Do not reintroduce the same glare as an ambiguity in
+                // the following global component pass.
+                guard candidateCenterX >= sleeveRegion.x,
+                      candidateCenterX < sleeveRegion.maxX,
+                      candidateCenterY >= sleeveRegion.y,
+                      candidateCenterY < sleeveRegion.maxY
+                else {
+                    continue
+                }
+                // Profile bounds intentionally discard unsupported fringe, so
+                // the component they came from can overhang by a block or two.
+                // That is not a second object; a separate plausible region is
+                // tens or hundreds of blocks away.
+                let tolerance = max(2, (4 * dpi + 300) / 600)
+                let isEnclosed = rect.x >= envelope.x - tolerance
+                    && rect.y >= envelope.y - tolerance
+                    && rect.maxX <= envelope.maxX + tolerance
+                    && rect.maxY <= envelope.maxY + tolerance
+                guard isEnclosed else {
+                    throw CardImageCropperError.ambiguousMediaBounds
+                }
+            }
+            coarse = envelope
+        } else {
+            if viable.count > 1,
+               viable[1].element.area * 2 >= dominant.element.area
+            {
+                throw CardImageCropperError.ambiguousMediaBounds
+            }
+            coarse = supportedBounds(
+                labels: labeled.labels,
+                target: Int32(dominant.offset),
+                width: maskWidth,
+                height: maskHeight,
+                dpi: dpi
+            ) ?? dominant.element.rect
         }
-
-        let coarse = supportedBounds(
-            labels: labeled.labels,
-            target: Int32(dominant.offset),
-            width: maskWidth,
-            height: maskHeight,
-            dpi: dpi
-        ) ?? dominant.element.rect
         var rect = PixelRect(
             x: coarse.x * scale,
             y: coarse.y * scale,
@@ -874,6 +1309,43 @@ extension CardImageCropper {
             throw CardImageCropperError.ambiguousMediaBounds
         }
         return rect
+    }
+
+    /// A conservative neighborhood in which a standard penny sleeve can lie.
+    ///
+    /// The dominant component is normally printed artwork or text inside the
+    /// card. It is reliable for location and orientation even when the clear
+    /// sleeve itself is fragmented into glare and shadow components. A penny
+    /// sleeve is nominally 2.625 × 3.625 inches; twelve percent of slack covers
+    /// scanner scale error, skew, wrinkles, and the sleeve's open lip without
+    /// admitting reflections from the rest of an A6 overscan frame.
+    func pennySleeveSearchRegion(
+        around anchor: PixelRect,
+        width: Int,
+        height: Int,
+        dpi: Int,
+        maskScale: Int
+    ) -> PixelRect {
+        let slack = 1.12
+        let shortSide = Int(
+            (2.625 * Double(dpi) / Double(maskScale) * slack).rounded(.up)
+        )
+        let longSide = Int(
+            (3.625 * Double(dpi) / Double(maskScale) * slack).rounded(.up)
+        )
+        let landscape = anchor.width >= anchor.height
+        let regionWidth = min(width, landscape ? longSide : shortSide)
+        let regionHeight = min(height, landscape ? shortSide : longSide)
+        let centerX = anchor.x + anchor.width / 2
+        let centerY = anchor.y + anchor.height / 2
+        let originX = min(max(0, centerX - regionWidth / 2), width - regionWidth)
+        let originY = min(max(0, centerY - regionHeight / 2), height - regionHeight)
+        return PixelRect(
+            x: originX,
+            y: originY,
+            width: regionWidth,
+            height: regionHeight
+        )
     }
 
     /// How far apart the two threshold reads may land before the permissive
@@ -951,6 +1423,57 @@ extension CardImageCropper {
         let columnSupportFloor = max(2, (4 * dpi + 300) / 600)
         let maximumBridgeGap = max(4, (8 * dpi + 300) / 600)
 
+        guard let anchorRow = rowOccupancy.indices.max(by: {
+                  rowOccupancy[$0] < rowOccupancy[$1]
+              }),
+              let anchorColumn = columnOccupancy.indices.max(by: {
+                  columnOccupancy[$0] < columnOccupancy[$1]
+              }),
+              rowOccupancy[anchorRow] >= rowSupportFloor,
+              columnOccupancy[anchorColumn] >= columnSupportFloor
+        else {
+            return nil
+        }
+
+        let rows = extendSupport(
+            rowOccupancy,
+            from: anchorRow,
+            floor: rowSupportFloor,
+            maximumBridgeGap: maximumBridgeGap
+        )
+        let columns = extendSupport(
+            columnOccupancy,
+            from: anchorColumn,
+            floor: columnSupportFloor,
+            maximumBridgeGap: maximumBridgeGap
+        )
+        return PixelRect(
+            x: columns.lowerBound,
+            y: rows.lowerBound,
+            width: columns.count,
+            height: rows.count
+        )
+    }
+
+    func supportedBounds(
+        mask: [UInt8],
+        width: Int,
+        height: Int,
+        dpi: Int
+    ) -> PixelRect? {
+        var rowOccupancy = [Int](repeating: 0, count: height)
+        var columnOccupancy = [Int](repeating: 0, count: width)
+        for y in 0..<height {
+            let rowStart = y * width
+            for x in 0..<width where mask[rowStart + x] != 0 {
+                rowOccupancy[y] += 1
+                columnOccupancy[x] += 1
+            }
+        }
+
+        let rowSupportFloor = max(2, (8 * dpi + 300) / 600)
+        let columnSupportFloor = max(2, (4 * dpi + 300) / 600)
+        let maximumBridgeGap = max(4, (8 * dpi + 300) / 600)
         guard let anchorRow = rowOccupancy.indices.max(by: {
                   rowOccupancy[$0] < rowOccupancy[$1]
               }),

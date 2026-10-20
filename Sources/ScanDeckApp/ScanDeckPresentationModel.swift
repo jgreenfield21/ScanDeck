@@ -63,6 +63,7 @@ struct ScanSideViewData: Identifiable, Equatable, Sendable {
     let imageURL: URL?
     let rotation: QuarterTurns
     let marginAssessment: MarginAssessment
+    let manualCrop: ManualCropRect?
 
     /// Where the published crop falls inside the master.
     ///
@@ -488,8 +489,11 @@ struct MarginAssessmentRequest: Sendable {
     let masterID: MasterID
     let imageURL: URL?
     let rotation: QuarterTurns
+    let manualCrop: ManualCropRect?
     let margins: ScanMargins
     let dpi: Int
+    let pairedMediaSize: MediaPixelSize?
+    let detectOrientation: Bool
 }
 
 struct BatchPublishRequest: Sendable {
@@ -497,6 +501,8 @@ struct BatchPublishRequest: Sendable {
     let destinationURL: URL
     let masterURLs: [MasterID: URL]
     let dpi: Int
+    let exportBackground: ExportBackground
+    let filenameStyle: PublishedFilenameStyle
 }
 
 struct BatchPublishReceipt: Sendable {
@@ -572,10 +578,26 @@ struct RecoveredBatchViewData: Identifiable, Equatable, Sendable {
 struct MarginAssessmentOutcome: Sendable {
     let assessment: MarginAssessment
     let publishedCrop: PublishedCrop?
+    let suggestedRotation: QuarterTurns?
+    let detectedMediaSize: MediaPixelSize?
+
+    init(
+        assessment: MarginAssessment,
+        publishedCrop: PublishedCrop?,
+        suggestedRotation: QuarterTurns? = nil,
+        detectedMediaSize: MediaPixelSize? = nil
+    ) {
+        self.assessment = assessment
+        self.publishedCrop = publishedCrop
+        self.suggestedRotation = suggestedRotation
+        self.detectedMediaSize = detectedMediaSize
+    }
 
     static let unpublishable = MarginAssessmentOutcome(
         assessment: .insufficient(edges: Set(ScanEdge.allCases)),
-        publishedCrop: nil
+        publishedCrop: nil,
+        suggestedRotation: nil,
+        detectedMediaSize: nil
     )
 }
 
@@ -731,6 +753,8 @@ final class ScanDeckPresentationModel {
     /// that will be produced rather than the whole scan frame. Presentation
     /// only, and rebuilt by re-analysis on recovery rather than persisted.
     private var publishedCrops: [MasterID: PublishedCrop] = [:]
+    private var detectedMediaSizes: [MasterID: MediaPixelSize] = [:]
+    private var orientationAssessedMasterIDs: Set<MasterID> = []
 
     @ObservationIgnored
     private var scanTask: Task<Void, Never>?
@@ -867,6 +891,24 @@ final class ScanDeckPresentationModel {
         var updated = settings
         updated.preferredScannerName = name
         apply(updated)
+    }
+
+    var exportBackground: ExportBackground {
+        get { settings.exportBackground }
+        set {
+            var updated = settings
+            updated.exportBackground = newValue
+            apply(updated)
+        }
+    }
+
+    var publishedFilenameStyle: PublishedFilenameStyle {
+        get { settings.publishedFilenameStyle }
+        set {
+            var updated = settings
+            updated.publishedFilenameStyle = newValue
+            apply(updated)
+        }
     }
 
     private func apply(_ updated: ScanDeckSettings) {
@@ -1180,6 +1222,7 @@ final class ScanDeckPresentationModel {
             imageURL: masterURLs[scannedSide.masterID],
             rotation: scannedSide.rotation,
             marginAssessment: scannedSide.marginAssessment,
+            manualCrop: scannedSide.manualCrop,
             publishedCrop: publishedCrops[scannedSide.masterID]
         )
     }
@@ -1867,14 +1910,17 @@ final class ScanDeckPresentationModel {
             return
         }
         let margins = session.requestedMargins
-        let pending = session.cards.flatMap { card -> [(MasterID, QuarterTurns)] in
+        let pending = session.cards.flatMap { card -> [(MasterID, QuarterTurns, ManualCropRect?)] in
             guard let sides = card.activeSides else {
                 return []
             }
             return [OutputSide.front, .back].compactMap { side in
-                sides[side].map { ($0.masterID, $0.rotation) }
+                sides[side].map { ($0.masterID, $0.rotation, $0.manualCrop) }
             }
         }
+        // Recovered sides may already contain operator rotation corrections.
+        // Never reinterpret those as fresh scans.
+        orientationAssessedMasterIDs.formUnion(pending.map(\.0))
 
         Task { [weak self] in
             // A sliding window of started analyses. `Task` here inherits the
@@ -1882,7 +1928,7 @@ final class ScanDeckPresentationModel {
             // owns — which is what makes counting them a real bound rather
             // than a bound on bookkeeping.
             var inFlight: [Task<Void, Never>] = []
-            for (masterID, rotation) in pending {
+            for (masterID, rotation, manualCrop) in pending {
                 if inFlight.count >= Self.marginAnalysisConcurrency {
                     await inFlight.removeFirst().value
                 }
@@ -1891,6 +1937,7 @@ final class ScanDeckPresentationModel {
                         await self?.assessMargin(
                             masterID: masterID,
                             rotation: rotation,
+                            manualCrop: manualCrop,
                             margins: margins
                         )
                     }
@@ -2173,6 +2220,15 @@ final class ScanDeckPresentationModel {
             return
         }
         rotate(cardID: selectedCardID, side: side)
+    }
+
+    func setManualCrop(
+        cardID: CardID,
+        side: OutputSide,
+        crop: ManualCropRect?
+    ) {
+        dispatch(.setManualCrop(cardID: cardID, side: side, crop: crop))
+        selectedCardID = cardID
     }
 
     func deleteSide(cardID: CardID, side: OutputSide) {
@@ -2772,7 +2828,7 @@ final class ScanDeckPresentationModel {
     /// Offered beside it when more than one card is blocking, because a batch
     /// with 26 blocked cards should not need 26 confirmations to say one thing.
     var otherBlockingPairMismatchCount: Int {
-        guard let cardID = cardPendingSizeAcceptanceConfirmation else {
+        guard cardPendingSizeAcceptanceConfirmation != nil else {
             return 0
         }
         return max(blockingPairMismatchCardIDs.count - 1, 0)
@@ -3411,7 +3467,9 @@ final class ScanDeckPresentationModel {
             candidate: candidate,
             destinationURL: destinationURL,
             masterURLs: masterURLs,
-            dpi: batchContext?.profile.resolutionDPI ?? 600
+            dpi: batchContext?.profile.resolutionDPI ?? 600,
+            exportBackground: settings.exportBackground,
+            filenameStyle: settings.publishedFilenameStyle
         )
 
         // The counts arrive from whichever thread is cropping. Funnelling them
@@ -3656,10 +3714,11 @@ final class ScanDeckPresentationModel {
     private func handle(_ effects: [BatchEffect]) {
         for effect in effects {
             switch effect {
-            case let .assessMargin(masterID, rotation, requestedMargins):
+            case let .assessMargin(masterID, rotation, manualCrop, requestedMargins):
                 assessMargin(
                     masterID: masterID,
                     rotation: rotation,
+                    manualCrop: manualCrop,
                     margins: requestedMargins
                 )
 
@@ -3683,13 +3742,17 @@ final class ScanDeckPresentationModel {
     private func assessMargin(
         masterID: MasterID,
         rotation: QuarterTurns,
-        margins: ScanMargins
+        manualCrop: ManualCropRect?,
+        margins: ScanMargins,
+        pairedMediaSize: MediaPixelSize? = nil
     ) {
         Task { [weak self] in
             await self?.assessMargin(
                 masterID: masterID,
                 rotation: rotation,
-                margins: margins
+                manualCrop: manualCrop,
+                margins: margins,
+                pairedMediaSize: pairedMediaSize
             )
         }
     }
@@ -3697,14 +3760,22 @@ final class ScanDeckPresentationModel {
     private func assessMargin(
         masterID: MasterID,
         rotation: QuarterTurns,
-        margins: ScanMargins
+        manualCrop: ManualCropRect?,
+        margins: ScanMargins,
+        pairedMediaSize: MediaPixelSize? = nil
     ) async {
+        let pairedMediaSize = pairedMediaSize
+            ?? self.pairedMediaSize(for: masterID)
+        let shouldDetectOrientation = orientationAssessedMasterIDs.insert(masterID).inserted
         let request = MarginAssessmentRequest(
             masterID: masterID,
             imageURL: masterURLs[masterID],
             rotation: rotation,
+            manualCrop: manualCrop,
             margins: margins,
-            dpi: batchContext?.profile.resolutionDPI ?? 600
+            dpi: batchContext?.profile.resolutionDPI ?? 600,
+            pairedMediaSize: pairedMediaSize,
+            detectOrientation: shouldDetectOrientation
         )
         let outcome = await actions.assessMargin(request)
         // A stale result for a superseded rotation is refused by the
@@ -3712,7 +3783,20 @@ final class ScanDeckPresentationModel {
         guard var candidate = session else {
             return
         }
+        let currentSide = candidate.cards
+            .compactMap(\.activeSides)
+            .flatMap { [$0.front, $0.back] }
+            .compactMap { $0 }
+            .first { $0.masterID == masterID }
+        guard currentSide?.rotation == rotation,
+              currentSide?.manualCrop == manualCrop
+        else {
+            return
+        }
         publishedCrops[masterID] = outcome.publishedCrop
+        if let detectedMediaSize = outcome.detectedMediaSize {
+            detectedMediaSizes[masterID] = detectedMediaSize
+        }
         let effects = try? BatchSessionReducer.reduce(
             .marginAssessed(
                 masterID: masterID,
@@ -3728,6 +3812,101 @@ final class ScanDeckPresentationModel {
         saveSession()
         handle(effects)
         surfacePairMismatch()
+
+        if shouldDetectOrientation,
+           let suggestedRotation = outcome.suggestedRotation,
+           suggestedRotation != rotation
+        {
+            var oriented = candidate
+            if let orientationEffects = try? BatchSessionReducer.reduce(
+                .automaticallyOrient(
+                    masterID: masterID,
+                    expectedRotation: rotation,
+                    rotation: suggestedRotation
+                ),
+                into: &oriented
+            ) {
+                session = oriented
+                saveSession()
+                handle(orientationEffects)
+                return
+            }
+        }
+
+        // An ambiguous side cannot contribute a footprint, but its duplex
+        // partner often can even when that partner is a few pixels short of a
+        // requested margin. Once either footprint arrives, retry the ambiguous
+        // mate with that physical size instead of requiring the partner to be
+        // fully margin-sufficient first.
+        if let detectedMediaSize = outcome.detectedMediaSize,
+           let partner = pairedSide(for: masterID, in: candidate),
+           detectedMediaSizes[partner.masterID] == nil,
+           case .insufficient = partner.marginAssessment
+        {
+            await assessMargin(
+                masterID: partner.masterID,
+                rotation: partner.rotation,
+                manualCrop: partner.manualCrop,
+                margins: margins,
+                pairedMediaSize: detectedMediaSize
+            )
+        }
+
+        // Sides normally arrive close together, so the first pass may run
+        // before its partner has a footprint. If this side failed only after
+        // the partner became sufficient, give it exactly one duplex-informed
+        // retry. A second failure remains visible and cannot loop.
+        if pairedMediaSize == nil,
+           case .insufficient = outcome.assessment,
+           let partnerSize = self.pairedMediaSize(for: masterID, in: candidate)
+        {
+            await assessMargin(
+                masterID: masterID,
+                rotation: rotation,
+                manualCrop: manualCrop,
+                margins: margins,
+                pairedMediaSize: partnerSize
+            )
+        }
+    }
+
+    private func pairedMediaSize(
+        for masterID: MasterID,
+        in session: BatchSession? = nil
+    ) -> MediaPixelSize? {
+        guard let session = session ?? self.session else { return nil }
+        for card in session.cards {
+            guard let sides = card.activeSides else { continue }
+            let partner: ScannedSide?
+            if sides.front?.masterID == masterID {
+                partner = sides.back
+            } else if sides.back?.masterID == masterID {
+                partner = sides.front
+            } else {
+                continue
+            }
+            if let partner {
+                if let measured = detectedMediaSizes[partner.masterID] {
+                    return measured
+                }
+                if case let .sufficient(size) = partner.marginAssessment {
+                    return size
+                }
+            }
+        }
+        return nil
+    }
+
+    private func pairedSide(
+        for masterID: MasterID,
+        in session: BatchSession
+    ) -> ScannedSide? {
+        for card in session.cards {
+            guard let sides = card.activeSides else { continue }
+            if sides.front?.masterID == masterID { return sides.back }
+            if sides.back?.masterID == masterID { return sides.front }
+        }
+        return nil
     }
 }
 

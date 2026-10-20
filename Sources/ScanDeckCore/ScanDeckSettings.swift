@@ -1,5 +1,23 @@
 import Foundation
 
+public enum ExportBackground: String, Codable, CaseIterable, Sendable {
+    case original
+    case white
+    case black
+}
+
+public enum PublishedFilenameStyle: String, Codable, CaseIterable, Sendable {
+    case abbreviated
+    case descriptive
+
+    public var template: FilenameTemplate {
+        switch self {
+        case .abbreviated: .cardDefault
+        case .descriptive: .descriptiveSides
+        }
+    }
+}
+
 /// Operator preferences that are not part of a job or a batch.
 ///
 /// Everything a *job* owns — margins, naming, resolution, counter — belongs to
@@ -23,14 +41,25 @@ public struct ScanDeckSettings: Codable, Equatable, Sendable {
     /// this person feeds a scanner, not of one batch.
     public var autoContinueSeconds: Int
 
+    /// How the margin outside the detected card is written to published JPEGs.
+    /// Masters and image analysis always retain the scanner's original pixels.
+    public var exportBackground: ExportBackground
+
+    /// How front and back are identified in newly published JPEG filenames.
+    public var publishedFilenameStyle: PublishedFilenameStyle
+
     public static let autoContinueSecondsRange = 1...60
 
     public init(
         preferredScannerName: String? = nil,
-        autoContinueSeconds: Int = 5
+        autoContinueSeconds: Int = 5,
+        exportBackground: ExportBackground = .original,
+        publishedFilenameStyle: PublishedFilenameStyle = .abbreviated
     ) {
         self.preferredScannerName = preferredScannerName
         self.autoContinueSeconds = autoContinueSeconds
+        self.exportBackground = exportBackground
+        self.publishedFilenameStyle = publishedFilenameStyle
     }
 
     /// Decoded field by field so a record written before a field existed still
@@ -46,6 +75,14 @@ public struct ScanDeckSettings: Codable, Equatable, Sendable {
             Int.self,
             forKey: .autoContinueSeconds
         ) ?? 5
+        exportBackground = try container.decodeIfPresent(
+            ExportBackground.self,
+            forKey: .exportBackground
+        ) ?? .original
+        publishedFilenameStyle = try container.decodeIfPresent(
+            PublishedFilenameStyle.self,
+            forKey: .publishedFilenameStyle
+        ) ?? .abbreviated
     }
 
     public static let `default` = ScanDeckSettings()

@@ -72,15 +72,27 @@ final class ScanDeckWorkflowActions: ScanDeckAppActions {
 
         let margins = request.margins
         let dpi = request.dpi
-        let analysis = await Task.detached(priority: .userInitiated) {
-            try? CardImageCropper().analyze(
+        let result = await Task.detached(priority: .userInitiated) {
+            let cropper = CardImageCropper()
+            guard let analysis = try? cropper.analyze(
                 sourceURL: imageURL,
                 margins: margins,
-                dpi: dpi
-            )
+                dpi: dpi,
+                manualCrop: request.manualCrop,
+                pairedMediaSize: request.pairedMediaSize
+            ) else {
+                return nil as (CropAnalysis, QuarterTurns?)?
+            }
+            let rotation = request.detectOrientation
+                ? CardOrientationDetector().suggestedRotation(
+                    for: imageURL,
+                    cropBounds: analysis.availableCropBounds
+                )
+                : nil
+            return (analysis, rotation)
         }.value
 
-        guard let analysis else {
+        guard let (analysis, suggestedRotation) = result else {
             // A master that cannot be analysed must never read as publishable.
             return .unpublishable
         }
@@ -114,6 +126,11 @@ final class ScanDeckWorkflowActions: ScanDeckAppActions {
                 bounds: analysis.availableCropBounds,
                 sourceWidth: analysis.sourceWidth,
                 sourceHeight: analysis.sourceHeight
+            ),
+            suggestedRotation: suggestedRotation,
+            detectedMediaSize: MediaPixelSize(
+                width: analysis.mediaBounds.width,
+                height: analysis.mediaBounds.height
             )
         )
     }
@@ -126,8 +143,16 @@ final class ScanDeckWorkflowActions: ScanDeckAppActions {
         let cards = try candidate.cards.map { card in
             PublicationCard(
                 sheetNumber: card.provisionalSheetNumber,
-                front: try side(card.front, in: request),
-                back: try side(card.back, in: request)
+                front: try side(
+                    card.front,
+                    pairedMediaSize: card.back.mediaSize,
+                    in: request
+                ),
+                back: try side(
+                    card.back,
+                    pairedMediaSize: card.front.mediaSize,
+                    in: request
+                )
             )
         }
 
@@ -136,7 +161,9 @@ final class ScanDeckWorkflowActions: ScanDeckAppActions {
             destinationRoot: request.destinationURL,
             cards: cards,
             margins: candidate.requestedMargins,
-            dpi: request.dpi
+            template: request.filenameStyle.template,
+            dpi: request.dpi,
+            exportBackground: request.exportBackground
         )
 
         let publisher = publisher
@@ -417,6 +444,7 @@ final class ScanDeckWorkflowActions: ScanDeckAppActions {
 
     private func side(
         _ completionSide: CompletionSide,
+        pairedMediaSize: MediaPixelSize?,
         in request: BatchPublishRequest
     ) throws -> PublicationSide {
         guard let url = request.masterURLs[completionSide.masterID] else {
@@ -426,7 +454,9 @@ final class ScanDeckWorkflowActions: ScanDeckAppActions {
         }
         return PublicationSide(
             masterURL: url,
-            rotation: completionSide.rotation
+            rotation: completionSide.rotation,
+            manualCrop: completionSide.manualCrop,
+            pairedMediaSize: pairedMediaSize
         )
     }
 

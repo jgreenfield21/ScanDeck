@@ -4,6 +4,86 @@ import Testing
 
 @Suite("Persisted batch session reducer")
 struct BatchSessionTests {
+    @Test("Automatic front orientation applies the duplex half-turn to the back")
+    func automaticOrientationAccountsForDuplexBack() throws {
+        var session = try makeSession(firstSheetNumber: 1)
+        let pass = scanPassID(950)
+        try reduce(.beginAppend(passID: pass), into: &session)
+        try receive(
+            pass: pass,
+            master: 950,
+            sequence: 0,
+            newCard: 950,
+            into: &session
+        )
+        try receive(
+            pass: pass,
+            master: 951,
+            sequence: 1,
+            into: &session
+        )
+        try reduce(.scanEnded(passID: pass, outcome: .completed), into: &session)
+
+        let effects = try reduce(
+            .automaticallyOrient(
+                masterID: masterID(950),
+                expectedRotation: .zero,
+                rotation: .clockwise270
+            ),
+            into: &session
+        )
+
+        let sides = try #require(session.cards[0].activeSides)
+        #expect(sides.front?.rotation == .clockwise270)
+        #expect(sides.back?.rotation == .clockwise90)
+        #expect(effects.count == 2)
+    }
+
+    @Test("Manual crop persists per side and requests fresh margin analysis")
+    func manualCropPersistsAndReassesses() throws {
+        var session = try makeSession(firstSheetNumber: 1)
+        let pass = scanPassID(900)
+        try reduce(.beginAppend(passID: pass), into: &session)
+        try receive(
+            pass: pass,
+            master: 900,
+            sequence: 0,
+            newCard: 900,
+            into: &session
+        )
+        try receive(
+            pass: pass,
+            master: 901,
+            sequence: 1,
+            into: &session
+        )
+        try reduce(.scanEnded(passID: pass, outcome: .completed), into: &session)
+
+        let crop = ManualCropRect(x: 0.12, y: 0.18, width: 0.7, height: 0.6)
+        let effects = try reduce(
+            .setManualCrop(cardID: cardID(900), side: .front, crop: crop),
+            into: &session
+        )
+
+        #expect(session.cards[0].activeSides?.front?.manualCrop == crop)
+        #expect(session.cards[0].activeSides?.back?.manualCrop == nil)
+        #expect(session.cards[0].activeSides?.front?.marginAssessment == .pending)
+        #expect(
+            effects == [
+                .assessMargin(
+                    masterID: masterID(900),
+                    rotation: .zero,
+                    manualCrop: crop,
+                    requestedMargins: session.requestedMargins
+                )
+            ]
+        )
+
+        let data = try JSONEncoder().encode(session)
+        let restored = try JSONDecoder().decode(BatchSession.self, from: data)
+        #expect(restored.cards[0].activeSides?.front?.manualCrop == crop)
+    }
+
     @Test("Append reserves stable numbers and an odd tail blocks Continue")
     func appendAndIncompleteGate() throws {
         var session = try makeSession(firstSheetNumber: 114)
@@ -440,6 +520,7 @@ struct BatchSessionTests {
                 .assessMargin(
                     masterID: masterID(50),
                     rotation: .clockwise90,
+                    manualCrop: nil,
                     requestedMargins: .cardDefault
                 )
             ]
@@ -1128,6 +1209,54 @@ struct BatchSessionTests {
             return
         }
         #expect(summary.releasedWithSizeWarnings == [64])
+    }
+
+    @Test("A manual crop bypasses the automatic pair-size check")
+    func manualCropBypassesPairSizeCheck() throws {
+        var session = try makeBlockingPairSession()
+        let cardID = session.cards[0].id
+        let originalFrontSize = try #require(
+            session.cards[0].assessedPairSizes?.front
+        )
+        #expect(session.completionBlockers.count == 1)
+
+        let crop = ManualCropRect(x: 0.1, y: 0.1, width: 0.8, height: 0.8)
+        try reduce(
+            .setManualCrop(cardID: cardID, side: .front, crop: crop),
+            into: &session
+        )
+        try reduce(
+            .marginAssessed(
+                masterID: try #require(
+                    session.cards[0].activeSides?.front?.masterID
+                ),
+                rotation: .zero,
+                result: .sufficient(mediaSize: originalFrontSize)
+            ),
+            into: &session
+        )
+
+        #expect(session.cards[0].hasManualCrop)
+        #expect(session.completionBlockers.isEmpty)
+        #expect(session.pairSizeWarnings.isEmpty)
+
+        try reduce(
+            .setManualCrop(cardID: cardID, side: .front, crop: nil),
+            into: &session
+        )
+        try reduce(
+            .marginAssessed(
+                masterID: try #require(
+                    session.cards[0].activeSides?.front?.masterID
+                ),
+                rotation: .zero,
+                result: .sufficient(mediaSize: originalFrontSize)
+            ),
+            into: &session
+        )
+
+        #expect(!session.cards[0].hasManualCrop)
+        #expect(session.completionBlockers.count == 1)
     }
 
     @Test("The blocking threshold is the wide one, and it is exclusive")
@@ -1826,6 +1955,7 @@ struct BatchSessionTests {
                 .assessMargin(
                     masterID: masterID(1),
                     rotation: .clockwise180,
+                    manualCrop: nil,
                     requestedMargins: session.requestedMargins
                 )
             ]

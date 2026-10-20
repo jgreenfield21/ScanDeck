@@ -286,6 +286,50 @@ private struct FilesSettingsView: View {
             }
 
             SettingsSection(
+                title: "Filenames",
+                explanation: "Choose how newly published front and back JPEGs are named. Existing batches are not renamed."
+            ) {
+                Picker(
+                    "Front and back",
+                    selection: Binding(
+                        get: { model.publishedFilenameStyle },
+                        set: { model.publishedFilenameStyle = $0 }
+                    )
+                ) {
+                    Text("-front / -back").tag(PublishedFilenameStyle.descriptive)
+                    Text("_F / _B (compatible)").tag(PublishedFilenameStyle.abbreviated)
+                }
+                .pickerStyle(.radioGroup)
+
+                Text(
+                    model.publishedFilenameStyle == .descriptive
+                        ? "Example: scan_000001-front.jpg"
+                        : "Example: scan_000001_F.jpg"
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .monospaced()
+            }
+
+            SettingsSection(
+                title: "Export background",
+                explanation: "Changes only the margin around the card in published JPEGs. Original scans and crop detection are not modified."
+            ) {
+                Picker(
+                    "Background",
+                    selection: Binding(
+                        get: { model.exportBackground },
+                        set: { model.exportBackground = $0 }
+                    )
+                ) {
+                    Text("Original scanner background").tag(ExportBackground.original)
+                    Text("White").tag(ExportBackground.white)
+                    Text("Black").tag(ExportBackground.black)
+                }
+                .pickerStyle(.radioGroup)
+            }
+
+            SettingsSection(
                 title: "Working files",
                 explanation: "Captured pages stay on disk until their batch "
                     + "publishes and its counter commits. ScanDeck never "

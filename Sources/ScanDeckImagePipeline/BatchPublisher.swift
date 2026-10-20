@@ -5,10 +5,19 @@ import ScanDeckCore
 public struct PublicationSide: Equatable, Sendable {
     public let masterURL: URL
     public let rotation: QuarterTurns
+    public let manualCrop: ManualCropRect?
+    public let pairedMediaSize: MediaPixelSize?
 
-    public init(masterURL: URL, rotation: QuarterTurns) {
+    public init(
+        masterURL: URL,
+        rotation: QuarterTurns,
+        manualCrop: ManualCropRect? = nil,
+        pairedMediaSize: MediaPixelSize? = nil
+    ) {
         self.masterURL = masterURL
         self.rotation = rotation
+        self.manualCrop = manualCrop
+        self.pairedMediaSize = pairedMediaSize
     }
 }
 
@@ -36,6 +45,7 @@ public struct PublicationRequest: Equatable, Sendable {
     public let template: FilenameTemplate
     public let dpi: Int
     public let quality: Double
+    public let exportBackground: ExportBackground
 
     public init(
         batchName: BatchName,
@@ -44,7 +54,8 @@ public struct PublicationRequest: Equatable, Sendable {
         margins: ScanMargins = .cardDefault,
         template: FilenameTemplate = .cardDefault,
         dpi: Int = 600,
-        quality: Double = 0.95
+        quality: Double = 0.95,
+        exportBackground: ExportBackground = .original
     ) {
         self.batchName = batchName
         self.destinationRoot = destinationRoot
@@ -53,6 +64,7 @@ public struct PublicationRequest: Equatable, Sendable {
         self.template = template
         self.dpi = dpi
         self.quality = quality
+        self.exportBackground = exportBackground
     }
 }
 
@@ -240,6 +252,7 @@ public struct BatchPublisher: Sendable {
         let margins = request.margins
         let dpi = request.dpi
         let quality = request.quality
+        let exportBackground = request.exportBackground
 
         try await withThrowingTaskGroup(of: Void.self) { group in
             var next = 0
@@ -266,7 +279,10 @@ public struct BatchPublisher: Sendable {
                             margins: margins,
                             dpi: dpi,
                             quality: quality,
-                            rotation: item.side.rotation
+                            rotation: item.side.rotation,
+                            exportBackground: exportBackground,
+                            manualCrop: item.side.manualCrop,
+                            pairedMediaSize: item.side.pairedMediaSize
                         )
                         try DurableFile.flush(destination)
                     }

@@ -14,6 +14,28 @@ import Testing
 @MainActor
 @Suite("Settings")
 struct SettingsTests {
+    @Test("The published filename style survives a relaunch")
+    func publishedFilenameStylePersists() {
+        let storage = InMemoryScanDeckSettingsStorage()
+        let first = makeModel(settingsStorage: storage)
+
+        #expect(first.model.publishedFilenameStyle == .abbreviated)
+        first.model.publishedFilenameStyle = .descriptive
+
+        #expect(makeModel(settingsStorage: storage).model.publishedFilenameStyle == .descriptive)
+    }
+
+    @Test("The export background survives a relaunch")
+    func exportBackgroundPersists() {
+        let storage = InMemoryScanDeckSettingsStorage()
+        let first = makeModel(settingsStorage: storage)
+
+        #expect(first.model.exportBackground == .original)
+        first.model.exportBackground = .black
+
+        #expect(makeModel(settingsStorage: storage).model.exportBackground == .black)
+    }
+
     @Test("A pinned scanner survives a relaunch")
     func preferredScannerPersists() {
         let storage = InMemoryScanDeckSettingsStorage()
